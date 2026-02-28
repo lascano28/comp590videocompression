@@ -87,11 +87,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => (),
         }
     }
+
     assert!(width != 0);
     assert!(height != 0);
 
     // Set up initial prior frame as uniform medium gray (y = 128)
     let mut prior_frame = vec![128 as u8; (width * height) as usize];
+    let mut temporally_coherent = vec![true; (width * height) as usize];
 
     let output_file = match File::create(&output_file_path) {
         Err(_) => panic!("Error opening output file"),
@@ -106,7 +108,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut enc = Encoder::new();
 
     // Set up arithmetic coding context(s)
-    let mut pixel_difference_pdf = VectorCountSymbolModel::new((0..=255).collect());
+    let mut temporal_good_pdf = VectorCountSymbolModel::new((0..=255).collect());
+    let mut temporal_bad_pdf = VectorCountSymbolModel::new((0..=255).collect());
 
     // Process frames
     for frame in iter.filter_frames() {
@@ -131,10 +134,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         + 256)
                         % 256;
 
-                    enc.encode(&pixel_difference, &pixel_difference_pdf, &mut bw);
+                    let mut temp_coherent_neighbor_count = 0;
+                    for dr in -1..=1 as i32 {
+                        for dc in -1..=1 as i32 {
+                            let nr = r as i32 + dr;
+                            let nc = c as i32 +dc;
+                            if nr >= 0 && nr < height as i32 && // Potential neighbor is in the frame vertically
+                               nc >= 0 && nc < width as i32 &&  // Potential neighbor is in the frame horizontally
+                               (dr != 0 || dc != 0) &&          // Potential neighbor is not same as target
+                               nr <= r as i32 &&                // Potential neighbor is not in next row
+                               (nc <= c as i32 || nr < r as i32)// Potential neighbor is not in target row beyond target column
+                               {
+                                if temporally_coherent[(nr*width as i32+nc) as usize] {
+                                    temp_coherent_neighbor_count += 1;
+                                }
+                            }
+                        }
+                    }
 
+                    if temp_coherent_neighbor_count >= 3 {
+                        enc.encode(&pixel_difference, &temporal_good_pdf, &mut bw);
+                        temporal_good_pdf.incr_count(&pixel_difference);
+                    } else {
+                        enc.encode(&pixel_difference, &temporal_bad_pdf, &mut bw);
+                        temporal_bad_pdf.incr_count(&pixel_difference);
+                    }
+
+                    if pixel_difference <= 25 || pixel_difference >= 256-25 {
+                        temporally_coherent[pixel_index] = true;
+                    } else {
+                        temporally_coherent[pixel_index] = false;
+                    }
                     // Update context
-                    pixel_difference_pdf.incr_count(&pixel_difference);
                 }
             }
 
@@ -183,7 +214,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Set up initial prior frame as uniform medium gray
         let mut prior_frame = vec![128 as u8; (width * height) as usize];
 
-        'outer_loop: 
+        'check_decode_loop: 
         for frame in iter.filter_frames() {
             if frame.frame_num < skip_count + count {
                 if verbose {
@@ -207,14 +238,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 c, r, current_frame[pixel_index], pixel_value
                             );
                             println!("Abandoning check of remaining frames");
-                            break 'outer_loop;
+                            break 'check_decode_loop;
                         }
                     }
                 }
                 println!("correct.");
                 prior_frame = current_frame;
             } else {
-                break 'outer_loop;
+                break 'check_decode_loop;
             }
         }
     }
@@ -225,7 +256,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "{} frames encoded, average size (bits): {}, compression ratio: {:.2}",
             count,
             enc.bits_written() / count as u64,
-            (width * height * 8 * count) as f64 / enc.bits_written() as f64
+            (width as u64 * height as u64 * 8 * count as u64) as f64 / enc.bits_written() as f64
         )
     }
 
