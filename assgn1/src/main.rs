@@ -106,7 +106,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut enc = Encoder::new();
 
     // Set up arithmetic coding context(s)
-    let mut pixel_difference_pdf = VectorCountSymbolModel::new((0..=255).collect());
+    // 256 contexts, one per possible prior-frame pixel value (0-255).
+    // The distribution of temporal residuals depends strongly on the prior pixel's
+    // intensity: a dark pixel can only brighten, a bright pixel can only darken, etc.
+    // Each context adapts its PDF to its specific prior-pixel intensity level.
+    let mut pdfs: Vec<VectorCountSymbolModel<i32>> = (0..256usize)
+        .map(|_| VectorCountSymbolModel::new((0..=255i32).collect()))
+        .collect();
 
     // Process frames
     for frame in iter.filter_frames() {
@@ -131,10 +137,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         + 256)
                         % 256;
 
-                    enc.encode(&pixel_difference, &pixel_difference_pdf, &mut bw);
+                    // Context = prior frame pixel value (0-255)
+                    let ctx = prior_frame[pixel_index] as usize;
+                    enc.encode(&pixel_difference, &pdfs[ctx], &mut bw);
 
                     // Update context
-                    pixel_difference_pdf.incr_count(&pixel_difference);
+                    pdfs[ctx].incr_count(&pixel_difference);
                 }
             }
 
@@ -178,12 +186,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut dec = Decoder::new();
 
-        let mut pixel_difference_pdf = VectorCountSymbolModel::new((0..=255).collect());
+        // Mirror encoder's 256 contexts (one per prior-frame pixel value)
+        let mut dec_pdfs: Vec<VectorCountSymbolModel<i32>> = (0..256usize)
+            .map(|_| VectorCountSymbolModel::new((0..=255i32).collect()))
+            .collect();
 
         // Set up initial prior frame as uniform medium gray
         let mut prior_frame = vec![128 as u8; (width * height) as usize];
 
-        'outer_loop: 
+        'outer_loop:
         for frame in iter.filter_frames() {
             if frame.frame_num < skip_count + count {
                 if verbose {
@@ -196,8 +207,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for r in 0..height {
                     for c in 0..width {
                         let pixel_index = (r * width + c) as usize;
-                        let decoded_pixel_difference = dec.decode(&pixel_difference_pdf, &mut br).to_owned();
-                        pixel_difference_pdf.incr_count(&decoded_pixel_difference);
+                        let ctx = prior_frame[pixel_index] as usize;
+                        let decoded_pixel_difference = dec.decode(&dec_pdfs[ctx], &mut br).to_owned();
+                        dec_pdfs[ctx].incr_count(&decoded_pixel_difference);
 
                         let pixel_value = (prior_frame[pixel_index] as i32 + decoded_pixel_difference) % 256;
 
